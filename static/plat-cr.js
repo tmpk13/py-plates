@@ -1,6 +1,7 @@
+import ALPR from '../src/alpr.js';
+
 // Config
 const CONFIG = {
-    FRAME_QUALITY: 1,
     FRAME_INTERVAL_MS: 15,
     MIN_OCR_CONF: 0.7,
     IDEAL_WIDTH: 2400,
@@ -16,20 +17,21 @@ const CONFIG = {
 // State
 const state = {
     stream: null,
-    ws: null,
+    alpr: null,
     intervalId: null,
     frameCount: 0,
     pendingFrame: false,
     cropWidth: 400,
     cropHeight: 400,
+    entries: [],
     // Zoom/selection
-    zoomRegion: null,       // null = full frame; { vx, vy, vw, vh } in video pixel coords
-    selActive: false,       // currently drawing a new selection
-    selStart: null,         // { cx, cy } canvas-internal pixels
-    selCurrent: null,       // { cx, cy } canvas-internal pixels during drag
-    moveMode: false,        // repositioning an existing zoom box
-    moveDragStart: null,    // { cx, cy } where move drag began
-    moveSnapshot: null      // copy of zoomRegion at move-drag start
+    zoomRegion: null,
+    selActive: false,
+    selStart: null,
+    selCurrent: null,
+    moveMode: false,
+    moveDragStart: null,
+    moveSnapshot: null
 };
 
 // DOM refs
@@ -40,12 +42,12 @@ const els = {
     startBtn: document.getElementById('start-btn'),
     streamBtn: document.getElementById('stream-btn'),
     stopStreamBtn: document.getElementById('stop-stream-btn'),
-    cropHeight: document.getElementById('crop-height'),
-    cropWidth: document.getElementById('crop-width'),
     controlButtons: document.getElementById('control-buttons'),
     status: document.getElementById('status'),
     zoomStatus: document.getElementById('zoom-status'),
     centeredToggle: document.getElementById('centered-toggle'),
+    dataList: document.getElementById('data-list'),
+    list: document.getElementById('list'),
     captureCanvas: document.createElement('canvas')
 };
 
@@ -71,6 +73,17 @@ function setZoomStatus(active) {
     }
 }
 
+function updateDetectionLog() {
+    if (state.entries.length === 0) {
+        els.dataList.style.display = 'none';
+        return;
+    }
+    els.dataList.style.display = 'flex';
+    els.list.innerHTML = state.entries
+        .map(e => `<li class="data">${e[0]} | ${e[2]} | ${e[1]}</li>`)
+        .join('');
+}
+
 function updateCenteredView() {
     if (!els.videoContainer) return;
     const centered = els.centeredToggle && els.centeredToggle.checked;
@@ -84,17 +97,12 @@ function updateCenteredView() {
     const W = window.innerWidth, H = window.innerHeight;
     const cw = els.canvas.width, ch = els.canvas.height;
 
-    // Center of zoom region in pre-transform screen coords
     const cx_s = (vx + vw / 2) / cw * W;
     const cy_s = (vy + vh / 2) / ch * H;
-
-    // Size of zoom region in screen coords
     const vw_s = vw / cw * W;
     const vh_s = vh / ch * H;
 
     const scale = Math.min(W / (vw_s * PAD), H / (vh_s * PAD));
-
-    // Translate so the zoom center lands at the viewport center
     const tx = W / 2 - cx_s * scale;
     const ty = H / 2 - cy_s * scale;
 
@@ -114,22 +122,45 @@ function getPointerCanvasPos(e) {
 const MIN_ZOOM = 50;
 
 function clampZoomRegion(r) {
-    const vw = els.video.videoWidth, vh = els.video.videoHeight;
+    const cw = els.canvas.width, ch = els.canvas.height;
     let { vx, vy, vw: w, vh: h } = r;
     w = Math.max(w, MIN_ZOOM);
     h = Math.max(h, MIN_ZOOM);
-    vx = Math.max(0, Math.min(vx, vw - w));
-    vy = Math.max(0, Math.min(vy, vh - h));
+    vx = Math.max(0, Math.min(vx, cw - w));
+    vy = Math.max(0, Math.min(vy, ch - h));
     return { vx, vy, vw: w, vh: h };
 }
 
+// object-fit: cover coordinate transforms
+function canvasToVideo(cx, cy) {
+    const rect = els.video.getBoundingClientRect();
+    const vw = els.video.videoWidth, vh = els.video.videoHeight;
+    const scale = Math.max(rect.width / vw, rect.height / vh);
+    const ox = (rect.width - vw * scale) / 2;
+    const oy = (rect.height - vh * scale) / 2;
+    return {
+        vx: (cx / els.canvas.width * rect.width - ox) / scale,
+        vy: (cy / els.canvas.height * rect.height - oy) / scale
+    };
+}
+
+function videoToCanvas(vx, vy) {
+    const rect = els.video.getBoundingClientRect();
+    const vw = els.video.videoWidth, vh = els.video.videoHeight;
+    const scale = Math.max(rect.width / vw, rect.height / vh);
+    const ox = (rect.width - vw * scale) / 2;
+    const oy = (rect.height - vh * scale) / 2;
+    return {
+        cx: (vx * scale + ox) / rect.width * els.canvas.width,
+        cy: (vy * scale + oy) / rect.height * els.canvas.height
+    };
+}
+
 // Zoom overlay drawing
-// Canvas internal pixels == video pixels (1:1) because canvas.width = videoWidth
 function drawZoomOverlay(ctx) {
     if (!ctx) ctx = els.canvas.getContext('2d');
     const cw = els.canvas.width, ch = els.canvas.height;
 
-    // In-progress selection drag — white dashed rect
     if (state.selActive && state.selStart && state.selCurrent) {
         const x = Math.min(state.selStart.cx, state.selCurrent.cx);
         const y = Math.min(state.selStart.cy, state.selCurrent.cy);
@@ -146,31 +177,25 @@ function drawZoomOverlay(ctx) {
         return;
     }
 
-    // Committed zoom region: dark vignette over entire frame, clear window for zoom area
     if (state.zoomRegion) {
         const { vx, vy, vw, vh } = state.zoomRegion;
 
         ctx.save();
-        // Dark overlay over entire canvas
         ctx.fillStyle = 'rgba(0,0,0,0.55)';
         ctx.fillRect(0, 0, cw, ch);
-        // Punch transparent hole so video shows through at full brightness
         ctx.clearRect(vx, vy, vw, vh);
         ctx.restore();
 
-        // Orange border around the clear window
         ctx.save();
         ctx.strokeStyle = CONFIG.COLORS.primary;
         ctx.lineWidth = 3;
         ctx.strokeRect(vx, vy, vw, vh);
 
-        // Corner handles
         const hs = 12;
         ctx.fillStyle = CONFIG.COLORS.primary;
         [[vx, vy], [vx + vw - hs, vy], [vx, vy + vh - hs], [vx + vw - hs, vy + vh - hs]]
             .forEach(([hx, hy]) => ctx.fillRect(hx, hy, hs, hs));
 
-        // ZOOM label above top-left corner
         ctx.fillRect(vx, vy - 24, 60, 24);
         ctx.fillStyle = '#fff';
         ctx.font = 'bold 13px monospace';
@@ -187,11 +212,10 @@ function isInsideZoom(pos) {
 
 // Pointer event handlers
 function onPointerDown(e) {
-    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+    if (!state.alpr) return;
 
     const pos = getPointerCanvasPos(e);
 
-    // If pointer starts inside existing zoom region, move it
     if (isInsideZoom(pos)) {
         state.moveMode = true;
         state.moveDragStart = pos;
@@ -201,7 +225,6 @@ function onPointerDown(e) {
         return;
     }
 
-    // New selection drag
     state.selActive = true;
     state.selStart = pos;
     state.selCurrent = pos;
@@ -235,7 +258,6 @@ function onPointerMove(e) {
         return;
     }
 
-    // Update cursor based on hover position
     els.canvas.style.cursor = isInsideZoom(pos) ? 'grab' : 'crosshair';
 }
 
@@ -256,8 +278,6 @@ function onPointerUp(_e) {
         const centerY = (state.selStart.cy + state.selCurrent.cy) / 2;
         const rawW = Math.abs(state.selCurrent.cx - state.selStart.cx);
         const rawH = Math.abs(state.selCurrent.cy - state.selStart.cy);
-
-        // If too small in either dimension, expand to MIN_ZOOM centered on the drag center
         const finalW = Math.max(rawW, MIN_ZOOM);
         const finalH = Math.max(rawH, MIN_ZOOM);
 
@@ -310,12 +330,7 @@ els.startBtn.onclick = async () => {
         state.cropWidth = width;
         state.cropHeight = height;
 
-        setStatus(
-            "",
-            `Camera ready: ${width}x${height}`,
-            CONFIG.COLORS.success
-        );
-
+        setStatus("", `Camera ready: ${width}x${height}`, CONFIG.COLORS.success);
         els.startBtn.disabled = true;
         els.streamBtn.disabled = false;
     } catch (err) {
@@ -323,34 +338,35 @@ els.startBtn.onclick = async () => {
     }
 };
 
-// WebSocket setup
-els.streamBtn.onclick = () => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    state.ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
-    state.frameCount = 0;
+// Start detection
+els.streamBtn.onclick = async () => {
+    els.streamBtn.disabled = true;
+    setStatus("", "Loading ALPR models...");
 
-    setupCanvasOverlay();
+    try {
+        if (!state.alpr) {
+            state.alpr = new ALPR();
+            await state.alpr.load();
+        }
 
-    state.ws.onopen = handleWSOpen;
-    state.ws.onmessage = handleWSMessage;
-    state.ws.onerror = handleWSError;
-    state.ws.onclose = handleWSClose;
+        state.frameCount = 0;
+        setupCanvasOverlay();
+
+        setStatus("", "Running detection...");
+        els.stopStreamBtn.disabled = false;
+
+        state.intervalId = setInterval(captureAndProcess, CONFIG.FRAME_INTERVAL_MS);
+    } catch (err) {
+        setStatus("", `Model load error: ${err.message}`, CONFIG.COLORS.error);
+        els.streamBtn.disabled = false;
+    }
 };
 
 function setupCanvasOverlay() {
-    const rect = els.video.getBoundingClientRect();
-
     els.canvas.width = state.cropWidth;
     els.canvas.height = state.cropHeight;
-    els.canvas.style.display = 'block';
-    els.canvas.style.position = 'fixed';
-    els.canvas.style.left = rect.left + 'px';
-    els.canvas.style.top = rect.top + 'px';
-    els.canvas.style.width = rect.width + 'px';
-    els.canvas.style.height = rect.height + 'px';
     els.canvas.style.pointerEvents = 'auto';
     els.canvas.style.cursor = 'crosshair';
-    els.canvas.style.zIndex = '10';
 
     els.canvas.addEventListener('pointerdown', onPointerDown);
     els.canvas.addEventListener('pointermove', onPointerMove);
@@ -363,23 +379,20 @@ function setupCanvasOverlay() {
     window.addEventListener('resize', updateCenteredView);
 }
 
-function handleWSOpen() {
-    setStatus("", 'Streaming to server...');
-    els.streamBtn.disabled = true;
-    els.stopStreamBtn.disabled = false;
-
-    state.intervalId = setInterval(captureAndSend, CONFIG.FRAME_INTERVAL_MS);
-}
-
-function captureAndSend() {
+async function captureAndProcess() {
     if (state.pendingFrame) return;
 
     let srcX, srcY, srcW, srcH;
     if (state.zoomRegion) {
-        srcX = state.zoomRegion.vx;
-        srcY = state.zoomRegion.vy;
-        srcW = state.zoomRegion.vw;
-        srcH = state.zoomRegion.vh;
+        const tl = canvasToVideo(state.zoomRegion.vx, state.zoomRegion.vy);
+        const br = canvasToVideo(
+            state.zoomRegion.vx + state.zoomRegion.vw,
+            state.zoomRegion.vy + state.zoomRegion.vh
+        );
+        srcX = Math.round(tl.vx);
+        srcY = Math.round(tl.vy);
+        srcW = Math.round(br.vx - tl.vx);
+        srcH = Math.round(br.vy - tl.vy);
     } else {
         srcX = 0;
         srcY = 0;
@@ -390,97 +403,88 @@ function captureAndSend() {
     els.captureCanvas.width = srcW;
     els.captureCanvas.height = srcH;
 
-    const ctx = els.captureCanvas.getContext('2d');
-    ctx.drawImage(els.video, srcX, srcY, srcW, srcH, 0, 0, srcW, srcH);
+    const captureCtx = els.captureCanvas.getContext('2d');
+    captureCtx.drawImage(els.video, srcX, srcY, srcW, srcH, 0, 0, srcW, srcH);
 
-    const frame = els.captureCanvas.toDataURL('image/jpeg', CONFIG.FRAME_QUALITY);
     state.frameCount++;
     state.pendingFrame = true;
 
-    state.ws.send(JSON.stringify({
-        frame: frame,
-        count: state.frameCount
-    }));
-}
+    try {
+        const result = await state.alpr.predict(els.captureCanvas);
 
-function handleWSMessage(event) {
+        if (result?.plate && result.plate !== "N/A") {
+            const now = new Date();
+            const time = now.toTimeString().slice(0, 8).replace(/:/g, "");
+            const date = now.toISOString().split("T")[0];
+            state.entries.unshift([result.plate, result.ocr_conf, `${time} ${date}`]);
+            if (state.entries.length > 100) state.entries.pop();
+            updateDetectionLog();
+        }
+
+        const ctx = els.canvas.getContext('2d');
+        ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
+        drawZoomOverlay(ctx);
+
+        if (result?.ocr_conf > CONFIG.MIN_OCR_CONF) {
+            drawDetection(ctx, result);
+        } else {
+            setStatus("", `Frame ${state.frameCount} processed`);
+        }
+    } catch (e) {
+        setStatus("", `Error: ${e.message}`, CONFIG.COLORS.error);
+    }
+
     state.pendingFrame = false;
-
-    const data = JSON.parse(event.data);
-
-    if (data.error) {
-        setStatus("", `Error: ${data.error}`, CONFIG.COLORS.error);
-        return;
-    }
-
-    const ctx = els.canvas.getContext('2d');
-    ctx.clearRect(0, 0, els.canvas.width, els.canvas.height);
-
-    // Always draw vignette/zoom overlay first
-    drawZoomOverlay(ctx);
-
-    if (data.predictions?.ocr_conf > CONFIG.MIN_OCR_CONF) {
-        drawDetection(ctx, data);
-    } else {
-        setStatus("", `Frame ${data.frame} processed`);
-    }
 }
 
-function drawDetection(ctx, data) {
-    const { bbox, plate, ocr_conf } = data.predictions;
-    const [serverW, serverH] = data.resolution.split('x').map(Number);
+function drawDetection(ctx, result) {
+    const { bbox, plate, ocr_conf } = result;
 
     let x1, y1, x2, y2;
     if (state.zoomRegion) {
-        // Server received the cropped zoom region (1:1 video pixels)
-        // Offset bbox by zoom region's top-left to position on full canvas
-        x1 = state.zoomRegion.vx + bbox[0];
-        y1 = state.zoomRegion.vy + bbox[1];
-        x2 = state.zoomRegion.vx + bbox[2];
-        y2 = state.zoomRegion.vy + bbox[3];
+        // bbox is in capture-canvas coords (video-space crop)
+        // Convert crop origin + bbox offset back to canvas coords
+        const tl = canvasToVideo(state.zoomRegion.vx, state.zoomRegion.vy);
+        const p1 = videoToCanvas(tl.vx + bbox[0], tl.vy + bbox[1]);
+        const p2 = videoToCanvas(tl.vx + bbox[2], tl.vy + bbox[3]);
+        x1 = p1.cx; y1 = p1.cy;
+        x2 = p2.cx; y2 = p2.cy;
     } else {
-        const scaleX = els.canvas.width / serverW;
-        const scaleY = els.canvas.height / serverH;
-        x1 = bbox[0] * scaleX;
-        y1 = bbox[1] * scaleY;
-        x2 = bbox[2] * scaleX;
-        y2 = bbox[3] * scaleY;
+        // bbox is in video coords, convert to canvas coords
+        const p1 = videoToCanvas(bbox[0], bbox[1]);
+        const p2 = videoToCanvas(bbox[2], bbox[3]);
+        x1 = p1.cx; y1 = p1.cy;
+        x2 = p2.cx; y2 = p2.cy;
     }
 
     const w = x2 - x1;
     const h = y2 - y1;
 
-    // Box
     ctx.strokeStyle = CONFIG.COLORS.primary;
     ctx.lineWidth = 3;
     ctx.strokeRect(x1, y1, w, h);
 
-    // Label bg
     ctx.fillStyle = CONFIG.COLORS.primary;
     ctx.fillRect(x1, y1 - 25, 100, 25);
 
-    // Label text
     ctx.fillStyle = CONFIG.COLORS.text;
     ctx.font = '16px monospace';
     ctx.fillText(plate, x1 + 5, y1 - 7);
 
-    // Status
     const confPct = (ocr_conf * 100).toFixed(1);
     setStatus("", `Detected: ${plate} (conf: ${confPct}%)`, CONFIG.COLORS.success);
 }
 
+// Stop detection
 els.stopStreamBtn.onclick = () => {
     clearInterval(state.intervalId);
-    state.ws.close();
 
-    // Reset zoom state
     state.zoomRegion = null;
     state.selActive = false;
     state.moveMode = false;
     state.selStart = null;
     state.selCurrent = null;
 
-    // Disable canvas interaction
     els.canvas.style.pointerEvents = 'none';
     els.canvas.style.cursor = '';
     els.canvas.removeEventListener('pointerdown', onPointerDown);
@@ -493,15 +497,7 @@ els.stopStreamBtn.onclick = () => {
 
     setZoomStatus(false);
     updateCenteredView();
-    setStatus("", 'Stream stopped');
+    setStatus("", 'Detection stopped');
     els.streamBtn.disabled = false;
     els.stopStreamBtn.disabled = true;
 };
-
-function handleWSError(error) {
-    setStatus("", `WebSocket error: ${error}`, CONFIG.COLORS.error);
-}
-
-function handleWSClose() {
-    setStatus("", 'Disconnected', CONFIG.COLORS.primary);
-}
