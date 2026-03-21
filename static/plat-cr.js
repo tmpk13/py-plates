@@ -75,16 +75,16 @@ function updateCenteredView() {
     if (!els.videoContainer) return;
     const centered = els.centeredToggle && els.centeredToggle.checked;
     if (!centered || !state.zoomRegion) {
+        els.videoContainer.style.transformOrigin = '0 0';
         els.videoContainer.style.transform = '';
-        els.videoContainer.style.transformOrigin = '';
         return;
     }
     const { vx, vy, vw, vh } = state.zoomRegion;
-    const PAD = 1.2; // 20% padding around zoom area
+    const PAD = 1.2;
     const W = window.innerWidth, H = window.innerHeight;
     const cw = els.canvas.width, ch = els.canvas.height;
 
-    // Center of zoom region mapped to screen coords
+    // Center of zoom region in pre-transform screen coords
     const cx_s = (vx + vw / 2) / cw * W;
     const cy_s = (vy + vh / 2) / ch * H;
 
@@ -94,8 +94,12 @@ function updateCenteredView() {
 
     const scale = Math.min(W / (vw_s * PAD), H / (vh_s * PAD));
 
-    els.videoContainer.style.transformOrigin = `${cx_s}px ${cy_s}px`;
-    els.videoContainer.style.transform = `scale(${scale})`;
+    // Translate so the zoom center lands at the viewport center
+    const tx = W / 2 - cx_s * scale;
+    const ty = H / 2 - cy_s * scale;
+
+    els.videoContainer.style.transformOrigin = '0 0';
+    els.videoContainer.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
 }
 
 // Helpers
@@ -209,8 +213,9 @@ function onPointerMove(e) {
     const ctx = els.canvas.getContext('2d');
 
     if (state.moveMode) {
-        const dx = pos.cx - state.moveDragStart.cx;
-        const dy = pos.cy - state.moveDragStart.cy;
+        const SENSITIVITY = 0.5;
+        const dx = (pos.cx - state.moveDragStart.cx) * SENSITIVITY;
+        const dy = (pos.cy - state.moveDragStart.cy) * SENSITIVITY;
         state.zoomRegion = clampZoomRegion({
             vx: state.moveSnapshot.vx + dx,
             vy: state.moveSnapshot.vy + dy,
