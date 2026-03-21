@@ -37,8 +37,6 @@ def stream(app, alpr, entries):
             alpr_data = None
             predictions = alpr.predict(img)
             
-            print(predictions.detection)
-
             if predictions:
                 alpr_data = extract(predictions)
             

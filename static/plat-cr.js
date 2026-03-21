@@ -150,6 +150,12 @@ function handleWSMessage(event) {
     state.pendingFrame = false;
 
     const data = JSON.parse(event.data);
+
+    if (data.error) {
+        setStatus("", `Error: ${data.error}`, CONFIG.COLORS.error);
+        return;
+    }
+
     const ctx = els.canvas.getContext('2d');
 
     if (data.predictions?.ocr_conf > CONFIG.MIN_OCR_CONF) {
@@ -196,15 +202,15 @@ function drawDetection(ctx, data) {
 els.stopStreamBtn.onclick = () => {
     clearInterval(state.intervalId);
     state.ws.close();
-    setStatus('Stream stopped');
+    setStatus("", 'Stream stopped');
     els.streamBtn.disabled = false;
     els.stopStreamBtn.disabled = true;
 };
 
 function handleWSError(error) {
-    setStatus(`WebSocket error: ${error}`, CONFIG.COLORS.error);
+    setStatus("", `WebSocket error: ${error}`, CONFIG.COLORS.error);
 }
 
 function handleWSClose() {
-    setStatus('Disconnected', CONFIG.COLORS.primary);
+    setStatus("", 'Disconnected', CONFIG.COLORS.primary);
 }
