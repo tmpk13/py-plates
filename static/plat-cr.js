@@ -14,6 +14,37 @@ const CONFIG = {
     }
 };
 
+// Plate log persistence
+const PLATE_LOG_KEY = 'alpr_plate_log';
+const DEBOUNCE_MS = 60 * 60 * 1000; // 1 hour
+
+function loadPlateLog() {
+    try {
+        const raw = localStorage.getItem(PLATE_LOG_KEY);
+        return raw ? JSON.parse(raw) : {};
+    } catch { return {}; }
+}
+
+function savePlateLog(log) {
+    localStorage.setItem(PLATE_LOG_KEY, JSON.stringify(log));
+}
+
+function recordPlate(plate) {
+    const log = loadPlateLog();
+    const now = Date.now();
+    if (log[plate]) {
+        const elapsed = now - log[plate].lastSeen;
+        if (elapsed >= DEBOUNCE_MS) {
+            log[plate].count++;
+            log[plate].lastSeen = now;
+        }
+    } else {
+        log[plate] = { count: 1, firstSeen: now, lastSeen: now };
+    }
+    savePlateLog(log);
+    return log[plate];
+}
+
 // State
 const state = {
     stream: null,
@@ -48,7 +79,10 @@ const els = {
     centeredToggle: document.getElementById('centered-toggle'),
     dataList: document.getElementById('data-list'),
     list: document.getElementById('list'),
-    captureCanvas: document.createElement('canvas')
+    captureCanvas: document.createElement('canvas'),
+    exportBtn: document.getElementById('export-btn'),
+    importBtn: document.getElementById('import-btn'),
+    importFile: document.getElementById('import-file')
 };
 
 // Utils
@@ -79,8 +113,12 @@ function updateDetectionLog() {
         return;
     }
     els.dataList.style.display = 'flex';
+    const log = loadPlateLog();
     els.list.innerHTML = state.entries
-        .map(e => `<li class="data">${e[0]} | ${e[2]} | ${e[1]}</li>`)
+        .map(e => {
+            const seenCount = log[e[0]]?.count ?? '?';
+            return `<li class="data">${e[0]} | ${e[2]} | x${seenCount}</li>`;
+        })
         .join('');
 }
 
@@ -416,6 +454,7 @@ async function captureAndProcess() {
             const now = new Date();
             const time = now.toTimeString().slice(0, 8).replace(/:/g, "");
             const date = now.toISOString().split("T")[0];
+            recordPlate(result.plate);
             state.entries.unshift([result.plate, result.ocr_conf, `${time} ${date}`]);
             if (state.entries.length > 100) state.entries.pop();
             updateDetectionLog();
@@ -474,6 +513,47 @@ function drawDetection(ctx, result) {
     const confPct = (ocr_conf * 100).toFixed(1);
     setStatus("", `Detected: ${plate} (conf: ${confPct}%)`, CONFIG.COLORS.success);
 }
+
+// Export plate log to JSON file
+els.exportBtn.onclick = () => {
+    const log = loadPlateLog();
+    const blob = new Blob([JSON.stringify(log, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `plates_${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+};
+
+// Import plate log from JSON file
+els.importBtn.onclick = () => els.importFile.click();
+els.importFile.onchange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+        try {
+            const imported = JSON.parse(ev.target.result);
+            const current = loadPlateLog();
+            for (const [plate, data] of Object.entries(imported)) {
+                if (current[plate]) {
+                    current[plate].count = Math.max(current[plate].count, data.count);
+                    current[plate].firstSeen = Math.min(current[plate].firstSeen, data.firstSeen);
+                    current[plate].lastSeen = Math.max(current[plate].lastSeen, data.lastSeen);
+                } else {
+                    current[plate] = data;
+                }
+            }
+            savePlateLog(current);
+            setStatus("", `Imported ${Object.keys(imported).length} plates`, CONFIG.COLORS.success);
+        } catch {
+            setStatus("", 'Invalid JSON file', CONFIG.COLORS.error);
+        }
+        els.importFile.value = '';
+    };
+    reader.readAsText(file);
+};
 
 // Stop detection
 els.stopStreamBtn.onclick = () => {
