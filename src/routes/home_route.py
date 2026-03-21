@@ -1,4 +1,4 @@
-from fasthtml.common import Title, Div, Canvas, Button, Script, Video, Input
+from fasthtml.common import Title, Div, Canvas, Button, Script, Video, Input, Style, Label
 
 js_file = ""
 with open("static/plat-cr.js", "r") as f:
@@ -29,9 +29,9 @@ def home(rt):
                         left: 0;
                         width: 100%;
                         height: 100%;
-                        pointer-events: none;
                     """
                 ),
+                id="video-container",
                 style="""
                     position: fixed;
                     top: 0;
@@ -39,6 +39,7 @@ def home(rt):
                     width: 100%;
                     height: 100%;
                     z-index: 1;
+                    overflow: hidden;
                 """
             ),
             # Controls overlay (fixed at bottom)
@@ -55,6 +56,12 @@ def home(rt):
                 #     style="display: flex; flex-direction: row; gap: 0.5rem; justify-content: center;"
                 # ),
                 Div(id="status", style="color: #888; margin-top: 0.5rem; text-align: center; font-size: 0.875rem;"),
+                Div(id="zoom-status", style="display: none; color: #ff6b35; font-size: 0.8rem; text-align: center;"),
+                Div(
+                    Input(type="checkbox", id="centered-toggle", style="cursor: pointer;"),
+                    Label("Center on zoom", htmlFor="centered-toggle", style="cursor: pointer; margin-left: 0.35rem;"),
+                    style="color: #ccc; font-size: 0.85rem; display: flex; align-items: center; justify-content: center;"
+                ),
                 id="control-buttons",
                 style="""
                     position: fixed;
