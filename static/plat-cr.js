@@ -3,7 +3,7 @@ import ALPR from '../src/alpr.js';
 // Config
 const CONFIG = {
     FRAME_INTERVAL_MS: 15,
-    MIN_OCR_CONF: 0.7,
+    MIN_OCR_CONF: 0.9,
     IDEAL_WIDTH: 2400,
     IDEAL_HEIGHT: 1800,
     COLORS: {
@@ -16,7 +16,28 @@ const CONFIG = {
 
 // Plate log persistence
 const PLATE_LOG_KEY = 'alpr_plate_log';
+const PLATE_LOG_OLD_KEY = 'alpr_plate_log_old';
 const DEBOUNCE_MS = 60 * 60 * 1000; // 1 hour
+const RECENT_WINDOW_MS = 60 * 1000; // 1 minute
+
+// Track whether a reset happened this session (for export)
+let resetThisSession = false;
+
+// Clean up old backups on startup — keep only one
+(function cleanupOldBackups() {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('alpr_plate_log_old_')) keys.push(k);
+    }
+    // Keep the newest one, remove the rest
+    if (keys.length > 1) {
+        keys.sort();
+        for (let i = 0; i < keys.length - 1; i++) {
+            localStorage.removeItem(keys[i]);
+        }
+    }
+})();
 
 function loadPlateLog() {
     try {
@@ -27,6 +48,17 @@ function loadPlateLog() {
 
 function savePlateLog(log) {
     localStorage.setItem(PLATE_LOG_KEY, JSON.stringify(log));
+}
+
+function loadOldPlateLog() {
+    // Find the old backup key
+    for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('alpr_plate_log_old_')) {
+            try { return JSON.parse(localStorage.getItem(k)); } catch { return {}; }
+        }
+    }
+    return {};
 }
 
 function recordPlate(plate) {
@@ -43,6 +75,62 @@ function recordPlate(plate) {
     }
     savePlateLog(log);
     return log[plate];
+}
+
+// Recent plates: last 5 unique plates seen within 1 minute
+const recentPlates = []; // [{plate, time}]
+
+function updateRecentPlates(plate) {
+    const now = Date.now();
+    // Add new plate to front
+    recentPlates.unshift({ plate, time: now });
+    // Remove duplicates (keep most recent)
+    const seen = new Set();
+    for (let i = recentPlates.length - 1; i >= 0; i--) {
+        if (seen.has(recentPlates[i].plate)) {
+            recentPlates.splice(i, 1);
+        } else {
+            seen.add(recentPlates[i].plate);
+        }
+    }
+    // Remove expired only if we have more than 5, or keep expired until replaced
+    // "replace plates not seen within a minute, do not remove unless a new plate is seen"
+    // So: expired plates stay until list exceeds 5
+    while (recentPlates.length > 5) {
+        // Remove from end (oldest)
+        const last = recentPlates[recentPlates.length - 1];
+        if (now - last.time > RECENT_WINDOW_MS) {
+            recentPlates.pop();
+        } else {
+            break;
+        }
+    }
+    // If still over 5, just cap
+    if (recentPlates.length > 5) recentPlates.length = 5;
+
+    renderRecentOverlay(plate);
+}
+
+function renderRecentOverlay(detectedPlate) {
+    const now = Date.now();
+    const log = loadPlateLog();
+    const recentEl = document.getElementById('recent-plates');
+    const bannerEl = document.getElementById('detection-banner');
+
+    // Render list — mark expired ones dimmer
+    recentEl.innerHTML = recentPlates.map(r => {
+        const expired = now - r.time > RECENT_WINDOW_MS;
+        const opacity = expired ? '0.4' : '1';
+        const style = `color:#fff; -webkit-text-stroke:1px #000; text-shadow:1px 1px 3px rgba(0,0,0,0.9); opacity:${opacity}`;
+        return `<li style="${style}">${r.plate}</li>`;
+    }).join('');
+
+    // Big bold detection banner
+    if (detectedPlate) {
+        const count = log[detectedPlate]?.count ?? 1;
+        bannerEl.textContent = `${detectedPlate}  x${count}`;
+        bannerEl.style.display = 'block';
+    }
 }
 
 // State
@@ -82,7 +170,10 @@ const els = {
     captureCanvas: document.createElement('canvas'),
     exportBtn: document.getElementById('export-btn'),
     importBtn: document.getElementById('import-btn'),
-    importFile: document.getElementById('import-file')
+    importFile: document.getElementById('import-file'),
+    resetBtn: document.getElementById('reset-btn'),
+    detectionBanner: document.getElementById('detection-banner'),
+    recentPlates: document.getElementById('recent-plates')
 };
 
 // Utils
@@ -450,7 +541,7 @@ async function captureAndProcess() {
     try {
         const result = await state.alpr.predict(els.captureCanvas);
 
-        if (result?.plate && result.plate !== "N/A") {
+        if (result?.plate && result.plate !== "N/A" && result.ocr_conf >= CONFIG.MIN_OCR_CONF) {
             const now = new Date();
             const time = now.toTimeString().slice(0, 8).replace(/:/g, "");
             const date = now.toISOString().split("T")[0];
@@ -458,6 +549,7 @@ async function captureAndProcess() {
             state.entries.unshift([result.plate, result.ocr_conf, `${time} ${date}`]);
             if (state.entries.length > 100) state.entries.pop();
             updateDetectionLog();
+            updateRecentPlates(result.plate);
         }
 
         const ctx = els.canvas.getContext('2d');
@@ -514,16 +606,30 @@ function drawDetection(ctx, result) {
     setStatus("", `Detected: ${plate} (conf: ${confPct}%)`, CONFIG.COLORS.success);
 }
 
-// Export plate log to JSON file
+// Export plate log to JSON file (+ old log as separate file if reset this session)
 els.exportBtn.onclick = () => {
+    const dateStr = new Date().toISOString().slice(0, 10);
     const log = loadPlateLog();
     const blob = new Blob([JSON.stringify(log, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `plates_${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = `plates_${dateStr}.json`;
     a.click();
     URL.revokeObjectURL(url);
+
+    if (resetThisSession) {
+        const old = loadOldPlateLog();
+        if (Object.keys(old).length > 0) {
+            const oldBlob = new Blob([JSON.stringify(old, null, 2)], { type: 'application/json' });
+            const oldUrl = URL.createObjectURL(oldBlob);
+            const oldA = document.createElement('a');
+            oldA.href = oldUrl;
+            oldA.download = `plates_old_${dateStr}.json`;
+            oldA.click();
+            URL.revokeObjectURL(oldUrl);
+        }
+    }
 };
 
 // Import plate log from JSON file
@@ -553,6 +659,58 @@ els.importFile.onchange = (e) => {
         els.importFile.value = '';
     };
     reader.readAsText(file);
+};
+
+// Reset count with 3-second confirmation
+let resetConfirmTimer = null;
+els.resetBtn.onclick = () => {
+    if (resetConfirmTimer) {
+        // Confirmed — do the reset
+        clearTimeout(resetConfirmTimer);
+        resetConfirmTimer = null;
+        els.resetBtn.textContent = 'Reset Count';
+        els.resetBtn.classList.remove('btn-error');
+
+        // Move current log to old with datetime in key name
+        const now = new Date();
+        const ts = now.toISOString().replace(/[:.]/g, '-');
+        const oldKey = `alpr_plate_log_old_${ts}`;
+
+        // Remove any existing old backups first (keep only one)
+        for (let i = localStorage.length - 1; i >= 0; i--) {
+            const k = localStorage.key(i);
+            if (k && k.startsWith('alpr_plate_log_old_')) {
+                localStorage.removeItem(k);
+            }
+        }
+
+        // Save current as old
+        const currentRaw = localStorage.getItem(PLATE_LOG_KEY);
+        if (currentRaw) localStorage.setItem(oldKey, currentRaw);
+
+        // Create fresh empty log
+        savePlateLog({});
+        resetThisSession = true;
+
+        // Clear UI state
+        state.entries = [];
+        recentPlates.length = 0;
+        updateDetectionLog();
+        els.recentPlates.innerHTML = '';
+        els.detectionBanner.style.display = 'none';
+
+        setStatus("", 'Counts reset', CONFIG.COLORS.success);
+        return;
+    }
+
+    // First click — start confirmation
+    els.resetBtn.textContent = 'Confirm?';
+    els.resetBtn.classList.add('btn-error');
+    resetConfirmTimer = setTimeout(() => {
+        resetConfirmTimer = null;
+        els.resetBtn.textContent = 'Reset Count';
+        els.resetBtn.classList.remove('btn-error');
+    }, 3000);
 };
 
 // Stop detection
