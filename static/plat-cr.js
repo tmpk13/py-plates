@@ -80,6 +80,50 @@ function recordPlate(plate) {
 // Recent plates: last 5 unique plates seen within 1 minute
 const recentPlates = []; // [{plate, time}]
 
+// Current plate display with minimum 2s on screen + queue
+const CURRENT_PLATE_MIN_MS = 2000;
+let currentDisplayPlate = null;
+let currentDisplayUntil = 0;
+const plateQueue = []; // queued plates (no duplicates)
+let queueTimerId = null;
+
+function enqueuePlate(plate) {
+    // Set as current immediately if nothing showing
+    const now = Date.now();
+    if (!currentDisplayPlate || now >= currentDisplayUntil) {
+        showCurrentPlate(plate);
+    } else {
+        // Add to queue if not already queued and not the current plate
+        if (plate !== currentDisplayPlate && !plateQueue.includes(plate)) {
+            plateQueue.push(plate);
+        }
+    }
+}
+
+function showCurrentPlate(plate) {
+    const log = loadPlateLog();
+    const count = log[plate]?.count ?? 1;
+    currentDisplayPlate = plate;
+    currentDisplayUntil = Date.now() + CURRENT_PLATE_MIN_MS;
+
+    const el = document.getElementById('current-plate');
+    el.textContent = `${plate}  x${count}`;
+    el.style.display = 'block';
+
+    // Schedule next from queue
+    clearTimeout(queueTimerId);
+    queueTimerId = setTimeout(advanceQueue, CURRENT_PLATE_MIN_MS);
+
+    renderTop5();
+}
+
+function advanceQueue() {
+    if (plateQueue.length > 0) {
+        showCurrentPlate(plateQueue.shift());
+    }
+    // current plate stays visible until replaced
+}
+
 function updateRecentPlates(plate) {
     const now = Date.now();
     // Add new plate to front
@@ -93,11 +137,7 @@ function updateRecentPlates(plate) {
             seen.add(recentPlates[i].plate);
         }
     }
-    // Remove expired only if we have more than 5, or keep expired until replaced
-    // "replace plates not seen within a minute, do not remove unless a new plate is seen"
-    // So: expired plates stay until list exceeds 5
     while (recentPlates.length > 5) {
-        // Remove from end (oldest)
         const last = recentPlates[recentPlates.length - 1];
         if (now - last.time > RECENT_WINDOW_MS) {
             recentPlates.pop();
@@ -105,31 +145,64 @@ function updateRecentPlates(plate) {
             break;
         }
     }
-    // If still over 5, just cap
     if (recentPlates.length > 5) recentPlates.length = 5;
 
-    renderRecentOverlay(plate);
+    enqueuePlate(plate);
+    renderAllPlatesList();
 }
 
-function renderRecentOverlay(detectedPlate) {
-    const now = Date.now();
+function renderTop5() {
     const log = loadPlateLog();
-    const recentEl = document.getElementById('recent-plates');
-    const bannerEl = document.getElementById('detection-banner');
+    const now = Date.now();
+    const top5El = document.getElementById('top5-plates');
 
-    // Render list — mark expired ones dimmer
-    recentEl.innerHTML = recentPlates.map(r => {
+    top5El.innerHTML = recentPlates.map(r => {
+        const count = log[r.plate]?.count ?? 1;
         const expired = now - r.time > RECENT_WINDOW_MS;
         const opacity = expired ? '0.4' : '1';
-        const style = `color:#fff; -webkit-text-stroke:1px #000; text-shadow:1px 1px 3px rgba(0,0,0,0.9); opacity:${opacity}`;
-        return `<li style="${style}">${r.plate}</li>`;
+        const isCurrent = r.plate === currentDisplayPlate;
+        const color = isCurrent ? '#ff6b35' : '#fff';
+        return `<div style="
+            font-size: 2.25rem;
+            font-weight: 900;
+            color: ${color};
+            -webkit-text-stroke: 1.5px #000;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.8), -1px -1px 2px rgba(0,0,0,0.6);
+            opacity: ${opacity};
+            white-space: nowrap;
+            text-align: right;
+        ">${r.plate}  x${count}</div>`;
+    }).join('');
+}
+
+function renderAllPlatesList() {
+    const log = loadPlateLog();
+    const listEl = document.getElementById('all-plates-list');
+    const wasAtTop = listEl.scrollTop <= 5;
+
+    const sorted = Object.entries(log)
+        .sort((a, b) => b[1].lastSeen - a[1].lastSeen);
+
+    listEl.innerHTML = sorted.map(([plate, data]) => {
+        const isCurrent = plate === currentDisplayPlate;
+        const color = isCurrent ? '#ff6b35' : '#fff';
+        const date = new Date(data.lastSeen);
+        const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        return `<div style="
+            font-size: 0.8rem;
+            color: ${color};
+            text-shadow: 1px 1px 2px rgba(0,0,0,0.9);
+            display: flex;
+            justify-content: space-between;
+            gap: 0.5rem;
+            padding: 0.1rem 0;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        "><span>${plate}</span><span style="opacity:0.7">x${data.count} ${timeStr}</span></div>`;
     }).join('');
 
-    // Big bold detection banner
-    if (detectedPlate) {
-        const count = log[detectedPlate]?.count ?? 1;
-        bannerEl.textContent = `${detectedPlate}  x${count}`;
-        bannerEl.style.display = 'block';
+    const autoScroll = document.getElementById('autoscroll-toggle')?.checked;
+    if (autoScroll && wasAtTop) {
+        listEl.scrollTop = 0;
     }
 }
 
@@ -165,15 +238,15 @@ const els = {
     status: document.getElementById('status'),
     zoomStatus: document.getElementById('zoom-status'),
     centeredToggle: document.getElementById('centered-toggle'),
-    dataList: document.getElementById('data-list'),
-    list: document.getElementById('list'),
     captureCanvas: document.createElement('canvas'),
     exportBtn: document.getElementById('export-btn'),
     importBtn: document.getElementById('import-btn'),
     importFile: document.getElementById('import-file'),
     resetBtn: document.getElementById('reset-btn'),
-    detectionBanner: document.getElementById('detection-banner'),
-    recentPlates: document.getElementById('recent-plates')
+    currentPlate: document.getElementById('current-plate'),
+    top5Plates: document.getElementById('top5-plates'),
+    allPlatesList: document.getElementById('all-plates-list'),
+    autoscrollToggle: document.getElementById('autoscroll-toggle')
 };
 
 // Utils
@@ -199,18 +272,7 @@ function setZoomStatus(active) {
 }
 
 function updateDetectionLog() {
-    if (state.entries.length === 0) {
-        els.dataList.style.display = 'none';
-        return;
-    }
-    els.dataList.style.display = 'flex';
-    const log = loadPlateLog();
-    els.list.innerHTML = state.entries
-        .map(e => {
-            const seenCount = log[e[0]]?.count ?? '?';
-            return `<li class="data">${e[0]} | ${e[2]} | x${seenCount}</li>`;
-        })
-        .join('');
+    // Detection log now handled by renderAllPlatesList
 }
 
 function updateCenteredView() {
@@ -652,6 +714,7 @@ els.importFile.onchange = (e) => {
                 }
             }
             savePlateLog(current);
+            renderAllPlatesList();
             setStatus("", `Imported ${Object.keys(imported).length} plates`, CONFIG.COLORS.success);
         } catch {
             setStatus("", 'Invalid JSON file', CONFIG.COLORS.error);
@@ -695,9 +758,14 @@ els.resetBtn.onclick = () => {
         // Clear UI state
         state.entries = [];
         recentPlates.length = 0;
-        updateDetectionLog();
-        els.recentPlates.innerHTML = '';
-        els.detectionBanner.style.display = 'none';
+        currentDisplayPlate = null;
+        currentDisplayUntil = 0;
+        plateQueue.length = 0;
+        clearTimeout(queueTimerId);
+        els.currentPlate.style.display = 'none';
+        els.currentPlate.textContent = '';
+        els.top5Plates.innerHTML = '';
+        els.allPlatesList.innerHTML = '';
 
         setStatus("", 'Counts reset', CONFIG.COLORS.success);
         return;
@@ -712,6 +780,27 @@ els.resetBtn.onclick = () => {
         els.resetBtn.classList.remove('btn-error');
     }, 3000);
 };
+
+// Autoscroll toggle — jump to top when checked
+els.autoscrollToggle.addEventListener('change', () => {
+    if (els.autoscrollToggle.checked) {
+        els.allPlatesList.scrollTop = 0;
+    }
+});
+
+// Render existing plates on load
+renderAllPlatesList();
+
+// Dynamically size the spacer to match the plate overlay height
+function updateSpacer() {
+    const overlay = document.getElementById('plate-overlay');
+    const spacer = document.getElementById('all-plates-spacer');
+    if (overlay && spacer) {
+        spacer.style.minHeight = (overlay.offsetHeight + 16) + 'px';
+    }
+    requestAnimationFrame(updateSpacer);
+}
+updateSpacer();
 
 // Stop detection
 els.stopStreamBtn.onclick = () => {
